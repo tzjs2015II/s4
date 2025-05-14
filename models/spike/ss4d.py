@@ -11,7 +11,7 @@ from src.models.spike.neuron import registry
 from src.models.spike.surrogate import piecewise_quadratic_surrogate
 from src.models.sequence.kernels.ssm import SSMKernelDiag
 
-
+# S4DKernel类：从对角SSM参数生成卷积核
 class S4DKernel(nn.Module):
     """Generate convolution kernel from diagonal SSM parameters."""
 
@@ -20,12 +20,17 @@ class S4DKernel(nn.Module):
         # Generate dt
         lr = min(lr, 0.001)
         H = d_model
+        # 随机生成对数形式的时间步长dt
         log_dt = torch.rand(H) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
 
+        # 随机生成复数形式 C
         C = torch.randn(channels, H, N // 2, dtype=torch.cfloat)
         self.C = nn.Parameter(torch.view_as_real(C))
+
+        # 注册log_dt参数，可配置学习率和权重衰减
         self.register("log_dt", log_dt, lr)
 
+        # 初始化A的实部虚部
         log_A_real = torch.log(0.5 * torch.ones(H, N // 2))
         A_imag = math.pi * repeat(torch.arange(N // 2), "n -> h n", h=H)
         self.register("log_A_real", log_A_real, lr)
@@ -37,14 +42,19 @@ class S4DKernel(nn.Module):
         """
 
         # Materialize parameters
+        # 计算实际的时间步长dt
         dt = torch.exp(self.log_dt)  # (H)
+        # 将C转换为复数形式
         C = torch.view_as_complex(self.C)  # (C H N)
+        # 计算A
         A = -torch.exp(self.log_A_real) + 1j * self.A_imag  # (H N)
 
         # Vandermonde multiplication
+        # 计算dtA
         dtA = A * dt.unsqueeze(-1)  # (H N)
         K = dtA.unsqueeze(-1) * torch.arange(L, device=A.device)  # (H N L)
         C = C * (torch.exp(dtA) - 1.0) / A
+        # 最终的卷积核
         K = 2 * torch.einsum("chn, hnl -> chl", C, torch.exp(K)).real
 
         return K, None
@@ -62,7 +72,7 @@ class S4DKernel(nn.Module):
                 optim["lr"] = lr
             setattr(getattr(self, name), "_optim", optim)
 
-
+# SpikingSSM类：实现了一个基于脉冲的状态空间模型
 class SS4D(nn.Module):
     def __init__(
         self,
@@ -90,18 +100,22 @@ class SS4D(nn.Module):
 
         if learnable_vth:
             if shared_vth:
+                # 如果共享阈值，定义一个可学习的阈值参数
                 self.ln_vth = nn.Parameter(torch.zeros(1))
             else:
+                # 否则为每个特征维度定义一个可学习的阈值参数
                 self.ln_vth = nn.Parameter(torch.zeros(d_model, 1))
-
         if bidirectional:
+            # 如果是双向的，通道数加倍
             channels *= 2
         # SSM Kernel
         if trainable_B:
+            # 如果B是可训练的，使用SSMKernelDiag生成卷积核
             self.kernel = SSMKernelDiag(d_model=self.h, d_state=self.n, channels=channels, init="diag-lin", **kernel_args)
         else:
+            # 否则使用S4DKernel生成卷积核
             self.kernel = S4DKernel(self.h, N=self.n, channels=channels, **kernel_args)
-
+        # 定义神经元模型
         self.neuron = registry[neuron](piecewise_quadratic_surrogate())
 
         # # Pointwise
@@ -112,6 +126,7 @@ class SS4D(nn.Module):
         self.dropout = dropout_fn(dropout) if dropout > 0.0 else nn.Identity()
 
         # position-wise output transform to mix features
+        # 定义输出线性变换层
         self.output_linear = nn.Sequential(
             nn.Conv1d(self.h, 2 * self.h, kernel_size=1),
             nn.GLU(dim=-2),
@@ -120,16 +135,20 @@ class SS4D(nn.Module):
     def forward(self, u, **kwargs):  # absorbs return_output and transformer src mask
         """Input and output shape (B, H, L)"""
         if not self.transposed:
+            # 如果输入不是转置的，进行转置
             u = u.transpose(-1, -2)
         L = u.size(-1)
 
         # Compute SSM Kernel
+        # 调用卷积核
         k, _ = self.kernel(L=L)  # (H L)
         if self.bidirectional:
+            # 如果是双向的，对卷积核进行处理
             k0, k1 = rearrange(k, "(s c) h l -> s c h l", s=2)
             k = F.pad(k0, (0, L)) + F.pad(k1.flip(-1), (L, 0))
 
         # Convolution
+        # 对卷积核进行操作
         k_f = torch.fft.rfft(k, n=2 * L)  # (C H L)
         u_f = torch.fft.rfft(u, n=2 * L)  # (B H L)
 
@@ -138,16 +157,19 @@ class SS4D(nn.Module):
         y = torch.fft.irfft(y, n=2 * L)[..., :L]  # (B C H L)
 
         # Compute D term in state space equation - essentially a skip connection
+        # 计算状态空间方程中的D项，即跳跃连接
         y = y + torch.einsum("bhl,ch->bchl", u, self.D)
 
         y = rearrange(y, "b c h l -> b (c h) l")
 
         if self.learnable_vth:
+            # 如果阈值是可学习的，对输出进行归一化
             y = y / torch.exp(self.ln_vth)
-
+        # 应用Dropout和神经元模型
         y = self.dropout(self.neuron(y))
         y = self.output_linear(y)
         if not self.transposed:
+            # 如果输出不是转置的，进行转置
             y = y.transpose(-1, -2)
         return (
             y,
