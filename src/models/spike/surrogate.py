@@ -1,6 +1,6 @@
 import torch
 
-# 继承自自动微分的torch.autograd.Function
+# 替代的反向传播函数 继承自自动微分的torch.autograd.Function
 class piecewise_quadratic(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
